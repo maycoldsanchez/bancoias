@@ -1,16 +1,15 @@
 package com.maycol.bancoias.infrastructure.out.r2dbc.adapter;
 
-import com.maycol.bancoias.domain.model.Transfer;
-import com.maycol.bancoias.domain.model.TransferCommand;
-import com.maycol.bancoias.domain.model.TransferStatus;
+import com.maycol.bancoias.domain.model.*;
 import com.maycol.bancoias.domain.spi.ITransferProcessingPort;
+import com.maycol.bancoias.infrastructure.exception.*;
 import io.r2dbc.spi.Row;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.r2dbc.core.DatabaseClient;
 import org.springframework.transaction.reactive.TransactionalOperator;
 import reactor.core.publisher.Mono;
 
-import java.math.BigDecimal;
-import java.math.RoundingMode;
+import java.math.*;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.OffsetDateTime;
@@ -33,29 +32,96 @@ public class R2dbcTransferProcessingAdapter implements ITransferProcessingPort {
   @Override
   public Mono<Transfer> process(TransferCommand command) {
 
-    return validate(command)
-      .then(
-        findByReference(command.clientReference())
-          .flatMap(existing ->
-            sameRequest(existing, command)
-              ? Mono.just(existing)
-              : Mono.error(
-              new IllegalArgumentException(
-                "clientReference ya fue usada con datos diferentes"
+    return Mono.defer(() ->
+        validate(command)
+          .then(
+            findByReference(
+              command.clientReference()
+            )
+              .flatMap(existing ->
+                sameRequest(
+                  existing,
+                  command
+                )
+                  ? Mono.just(existing)
+                  : Mono.error(
+                  new BusinessException(
+                    "IDEMPOTENCY_CONFLICT",
+                    "clientReference ya fue usada con datos diferentes"
+                  )
+                )
+              )
+              .switchIfEmpty(
+                createNew(command)
+              )
+          )
+      )
+      .onErrorResume(
+        DataIntegrityViolationException.class,
+        e ->
+          findByReference(
+            command.clientReference()
+          )
+            .switchIfEmpty(
+              Mono.error(e)
+            )
+            .flatMap(existing ->
+              sameRequest(
+                existing,
+                command
+              )
+                ? Mono.just(existing)
+                : Mono.error(
+                new BusinessException(
+                  "IDEMPOTENCY_CONFLICT",
+                  "clientReference ya fue usada con datos diferentes"
+                )
               )
             )
-          )
-          .switchIfEmpty(
-            createNew(command)
-          )
       );
   }
 
-  private Mono<Void> validate(TransferCommand command) {
+  private Mono<Transfer> createNew(
+    TransferCommand command
+  ) {
+
+    UUID id = UUID.randomUUID();
+    OffsetDateTime now = OffsetDateTime.now();
+    String fingerprint = fingerprint(command);
+
+    return tx.transactional(
+      validateAccounts(command)
+        .then(
+          insert(
+            id,
+            command,
+            fingerprint,
+            now
+          )
+        )
+        .then(
+          debit(command)
+        )
+        .then(
+          credit(command)
+        )
+        .then(
+          markCompleted(id, now)
+        )
+        .then(
+          findById(id)
+        )
+    );
+  }
+
+  private Mono<Void> validate(
+    TransferCommand command
+  ) {
 
     if (!"COP".equals(command.currency())) {
       return Mono.error(
-        new IllegalArgumentException(
+        new BusinessException(
+          "INVALID_CURRENCY",
           "La moneda debe ser COP"
         )
       );
@@ -65,17 +131,21 @@ public class R2dbcTransferProcessingAdapter implements ITransferProcessingPort {
       command.destinationAccount()
     )) {
       return Mono.error(
-        new IllegalArgumentException(
+        new BusinessException(
+          "SAME_ACCOUNT",
           "La cuenta origen y destino deben ser diferentes"
         )
       );
     }
 
     if (command.amount().scale() > 2
-      || command.amount().compareTo(BigDecimal.ZERO) <= 0) {
+      || command.amount().compareTo(
+      BigDecimal.ZERO
+    ) <= 0) {
 
       return Mono.error(
-        new IllegalArgumentException(
+        new BusinessException(
+          "INVALID_AMOUNT",
           "El monto debe ser mayor que cero y tener máximo dos decimales"
         )
       );
@@ -84,53 +154,17 @@ public class R2dbcTransferProcessingAdapter implements ITransferProcessingPort {
     return Mono.empty();
   }
 
-  private Mono<Transfer> createNew(
-    TransferCommand command
-  ) {
-
-    UUID id = UUID.randomUUID();
-    OffsetDateTime now = OffsetDateTime.now();
-    String fingerprint = createFingerprint(command);
-
-    return tx.transactional(
-
-      validateAccounts(command)
-
-        .then(
-          insert(
-            id,
-            command,
-            fingerprint,
-            now
-          )
-        )
-
-        .then(
-          debit(command)
-        )
-
-        .then(
-          credit(command)
-        )
-
-        .then(
-          markCompleted(id, now)
-        )
-
-        .then(
-          findById(id)
-        )
-    );
-  }
-
   private Mono<Void> validateAccounts(
     TransferCommand command
   ) {
 
-    return accountStatus(command.sourceAccount())
+    return accountStatus(
+      command.sourceAccount()
+    )
       .switchIfEmpty(
         Mono.error(
-          new IllegalArgumentException(
+          new BusinessException(
+            "SOURCE_ACCOUNT_NOT_FOUND",
             "La cuenta origen no existe"
           )
         )
@@ -139,7 +173,8 @@ public class R2dbcTransferProcessingAdapter implements ITransferProcessingPort {
         "ACTIVE".equals(status)
           ? Mono.empty()
           : Mono.error(
-          new IllegalArgumentException(
+          new BusinessException(
+            "SOURCE_ACCOUNT_INACTIVE",
             "La cuenta origen no está activa"
           )
         )
@@ -150,7 +185,8 @@ public class R2dbcTransferProcessingAdapter implements ITransferProcessingPort {
         )
           .switchIfEmpty(
             Mono.error(
-              new IllegalArgumentException(
+              new BusinessException(
+                "DESTINATION_ACCOUNT_NOT_FOUND",
                 "La cuenta destino no existe"
               )
             )
@@ -159,7 +195,8 @@ public class R2dbcTransferProcessingAdapter implements ITransferProcessingPort {
             "ACTIVE".equals(status)
               ? Mono.empty()
               : Mono.error(
-              new IllegalArgumentException(
+              new BusinessException(
+                "DESTINATION_ACCOUNT_INACTIVE",
                 "La cuenta destino no está activa"
               )
             )
@@ -175,7 +212,10 @@ public class R2dbcTransferProcessingAdapter implements ITransferProcessingPort {
         "SELECT status FROM accounts " +
           "WHERE account_number = :number"
       )
-      .bind("number", number)
+      .bind(
+        "number",
+        number
+      )
       .map((row, metadata) ->
         row.get(
           "status",
@@ -264,7 +304,8 @@ public class R2dbcTransferProcessingAdapter implements ITransferProcessingPort {
         rows == 1
           ? Mono.empty()
           : Mono.error(
-          new IllegalArgumentException(
+          new BusinessException(
+            "INSUFFICIENT_BALANCE",
             "Saldo insuficiente"
           )
         )
@@ -297,7 +338,8 @@ public class R2dbcTransferProcessingAdapter implements ITransferProcessingPort {
         rows == 1
           ? Mono.empty()
           : Mono.error(
-          new IllegalArgumentException(
+          new BusinessException(
+            "DESTINATION_ACCOUNT_INACTIVE",
             "La cuenta destino no está activa"
           )
         )
@@ -337,18 +379,23 @@ public class R2dbcTransferProcessingAdapter implements ITransferProcessingPort {
       )
       .bind("id", id)
       .map(this::map)
-      .one();
+      .one()
+      .switchIfEmpty(
+        Mono.error(
+          new TransferNotFoundException()
+        )
+      );
   }
 
   private Mono<Transfer> findByReference(
-    String reference
+    String ref
   ) {
 
     return db.sql(
         "SELECT * FROM transfers " +
           "WHERE client_reference=:ref"
       )
-      .bind("ref", reference)
+      .bind("ref", ref)
       .map(this::map)
       .one();
   }
@@ -404,11 +451,11 @@ public class R2dbcTransferProcessingAdapter implements ITransferProcessingPort {
 
     return transfer.fingerprint()
       .equals(
-        createFingerprint(command)
+        fingerprint(command)
       );
   }
 
-  private String createFingerprint(
+  private String fingerprint(
     TransferCommand command
   ) {
 
@@ -428,22 +475,19 @@ public class R2dbcTransferProcessingAdapter implements ITransferProcessingPort {
         command.currency()
       );
 
-      return HexFormat.of().formatHex(
-        MessageDigest
-          .getInstance("SHA-256")
-          .digest(
-            payload.getBytes(
-              StandardCharsets.UTF_8
+      return HexFormat.of()
+        .formatHex(
+          MessageDigest
+            .getInstance("SHA-256")
+            .digest(
+              payload.getBytes(
+                StandardCharsets.UTF_8
+              )
             )
-          )
-      );
+        );
 
     } catch (Exception e) {
-
-      throw new IllegalStateException(
-        "No fue posible calcular la huella",
-        e
-      );
+      throw new IllegalStateException("No fue posible calcular la huella", e);
     }
   }
 }
