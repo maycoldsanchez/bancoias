@@ -4,6 +4,7 @@ import com.maycol.bancoias.domain.model.Transfer;
 import com.maycol.bancoias.domain.model.TransferCommand;
 import com.maycol.bancoias.domain.model.TransferStatus;
 import com.maycol.bancoias.domain.spi.ITransferProcessingPort;
+import io.r2dbc.spi.Row;
 import org.springframework.r2dbc.core.DatabaseClient;
 import org.springframework.transaction.reactive.TransactionalOperator;
 import reactor.core.publisher.Mono;
@@ -21,7 +22,10 @@ public class R2dbcTransferProcessingAdapter implements ITransferProcessingPort {
   private final DatabaseClient db;
   private final TransactionalOperator tx;
 
-  public R2dbcTransferProcessingAdapter(DatabaseClient db, TransactionalOperator tx) {
+  public R2dbcTransferProcessingAdapter(
+    DatabaseClient db,
+    TransactionalOperator tx
+  ) {
     this.db = db;
     this.tx = tx;
   }
@@ -29,256 +33,417 @@ public class R2dbcTransferProcessingAdapter implements ITransferProcessingPort {
   @Override
   public Mono<Transfer> process(TransferCommand command) {
 
+    return validate(command)
+      .then(
+        findByReference(command.clientReference())
+          .flatMap(existing ->
+            sameRequest(existing, command)
+              ? Mono.just(existing)
+              : Mono.error(
+              new IllegalArgumentException(
+                "clientReference ya fue usada con datos diferentes"
+              )
+            )
+          )
+          .switchIfEmpty(
+            createNew(command)
+          )
+      );
+  }
+
+  private Mono<Void> validate(TransferCommand command) {
+
     if (!"COP".equals(command.currency())) {
-      return Mono.error(new IllegalArgumentException("La moneda debe ser COP"));
+      return Mono.error(
+        new IllegalArgumentException(
+          "La moneda debe ser COP"
+        )
+      );
     }
 
-    if (command.sourceAccount().equals(command.destinationAccount())) {
-      return Mono.error(new IllegalArgumentException(
-        "La cuenta origen y destino deben ser diferentes"));
+    if (command.sourceAccount().equals(
+      command.destinationAccount()
+    )) {
+      return Mono.error(
+        new IllegalArgumentException(
+          "La cuenta origen y destino deben ser diferentes"
+        )
+      );
     }
 
     if (command.amount().scale() > 2
       || command.amount().compareTo(BigDecimal.ZERO) <= 0) {
-      return Mono.error(new IllegalArgumentException(
-        "El monto debe ser mayor que cero y tener máximo dos decimales"));
+
+      return Mono.error(
+        new IllegalArgumentException(
+          "El monto debe ser mayor que cero y tener máximo dos decimales"
+        )
+      );
     }
 
-    return db.sql(
-        "SELECT * FROM transfers WHERE client_reference = :ref")
-      .bind("ref", command.clientReference())
-      .map((row, metadata) -> new Transfer(
-        row.get("id", UUID.class),
-        row.get("client_reference", String.class),
-        row.get("source_account", String.class),
-        row.get("destination_account", String.class),
-        row.get("amount", BigDecimal.class),
-        row.get("currency", String.class),
-        TransferStatus.valueOf(row.get("status", String.class)),
-        row.get("processed_at", OffsetDateTime.class),
-        row.get("request_fingerprint", String.class)
-      ))
-      .one()
-      .flatMap(existing -> {
+    return Mono.empty();
+  }
 
-        String payload = String.join(
-          "|",
-          command.clientReference(),
-          command.sourceAccount(),
-          command.destinationAccount(),
-          command.amount()
-            .setScale(2, RoundingMode.UNNECESSARY)
-            .toPlainString(),
-          command.currency()
-        );
+  private Mono<Transfer> createNew(
+    TransferCommand command
+  ) {
 
-        String fingerprint;
+    UUID id = UUID.randomUUID();
+    OffsetDateTime now = OffsetDateTime.now();
+    String fingerprint = createFingerprint(command);
 
-        try {
-          fingerprint = HexFormat.of().formatHex(
-            MessageDigest.getInstance("SHA-256")
-              .digest(payload.getBytes(StandardCharsets.UTF_8))
-          );
-        } catch (Exception e) {
-          return Mono.error(e);
-        }
+    return tx.transactional(
 
-        if (existing.fingerprint().equals(fingerprint)) {
-          return Mono.just(existing);
-        }
+      validateAccounts(command)
 
-        return Mono.error(new IllegalArgumentException(
-          "clientReference ya fue usada con datos diferentes"));
-      })
-      .switchIfEmpty(Mono.defer(() -> {
+        .then(
+          insert(
+            id,
+            command,
+            fingerprint,
+            now
+          )
+        )
 
-        UUID id = UUID.randomUUID();
-        OffsetDateTime now = OffsetDateTime.now();
+        .then(
+          debit(command)
+        )
 
-        String payload = String.join(
-          "|",
-          command.clientReference(),
-          command.sourceAccount(),
-          command.destinationAccount(),
-          command.amount()
-            .setScale(2, RoundingMode.UNNECESSARY)
-            .toPlainString(),
-          command.currency()
-        );
+        .then(
+          credit(command)
+        )
 
-        String fingerprint;
+        .then(
+          markCompleted(id, now)
+        )
 
-        try {
-          fingerprint = HexFormat.of().formatHex(
-            MessageDigest.getInstance("SHA-256")
-              .digest(payload.getBytes(StandardCharsets.UTF_8))
-          );
-        } catch (Exception e) {
-          return Mono.error(e);
-        }
+        .then(
+          findById(id)
+        )
+    );
+  }
 
-        return tx.transactional(
+  private Mono<Void> validateAccounts(
+    TransferCommand command
+  ) {
 
-          db.sql(
-              "SELECT status FROM accounts " +
-                "WHERE account_number = :number")
-            .bind("number", command.sourceAccount())
-            .map((row, metadata) ->
-              row.get("status", String.class))
-            .one()
-            .switchIfEmpty(Mono.error(
+    return accountStatus(command.sourceAccount())
+      .switchIfEmpty(
+        Mono.error(
+          new IllegalArgumentException(
+            "La cuenta origen no existe"
+          )
+        )
+      )
+      .flatMap(status ->
+        "ACTIVE".equals(status)
+          ? Mono.empty()
+          : Mono.error(
+          new IllegalArgumentException(
+            "La cuenta origen no está activa"
+          )
+        )
+      )
+      .then(
+        accountStatus(
+          command.destinationAccount()
+        )
+          .switchIfEmpty(
+            Mono.error(
               new IllegalArgumentException(
-                "La cuenta origen no existe")))
-            .flatMap(status -> {
-
-              if (!"ACTIVE".equals(status)) {
-                return Mono.error(
-                  new IllegalArgumentException(
-                    "La cuenta origen no está activa"));
-              }
-
-              return Mono.empty();
-            })
-
-            .then(
-              db.sql(
-                  "SELECT status FROM accounts " +
-                    "WHERE account_number = :number")
-                .bind("number", command.destinationAccount())
-                .map((row, metadata) ->
-                  row.get("status", String.class))
-                .one()
-                .switchIfEmpty(Mono.error(
-                  new IllegalArgumentException(
-                    "La cuenta destino no existe")))
-                .flatMap(status -> {
-
-                  if (!"ACTIVE".equals(status)) {
-                    return Mono.error(
-                      new IllegalArgumentException(
-                        "La cuenta destino no está activa"));
-                  }
-
-                  return Mono.empty();
-                })
+                "La cuenta destino no existe"
+              )
             )
-
-            .then(
-              db.sql(
-                  "INSERT INTO transfers " +
-                    "(id, client_reference, request_fingerprint, " +
-                    "source_account, destination_account, amount, " +
-                    "currency, status, processed_at) " +
-                    "VALUES (:id,:ref,:fp,:source,:destination," +
-                    ":amount,:currency,'PENDING',:processedAt)")
-                .bind("id", id)
-                .bind("ref", command.clientReference())
-                .bind("fp", fingerprint)
-                .bind("source", command.sourceAccount())
-                .bind("destination", command.destinationAccount())
-                .bind("amount", command.amount()
-                  .setScale(2, RoundingMode.UNNECESSARY))
-                .bind("currency", command.currency())
-                .bind("processedAt", now)
-                .fetch()
-                .rowsUpdated()
+          )
+          .flatMap(status ->
+            "ACTIVE".equals(status)
+              ? Mono.empty()
+              : Mono.error(
+              new IllegalArgumentException(
+                "La cuenta destino no está activa"
+              )
             )
+          )
+      );
+  }
 
-            .then(
-              db.sql(
-                  "UPDATE accounts SET balance = balance - :amount " +
-                    "WHERE account_number = :number " +
-                    "AND status = 'ACTIVE' " +
-                    "AND currency = 'COP' " +
-                    "AND balance >= :amount")
-                .bind("amount", command.amount())
-                .bind("number", command.sourceAccount())
-                .fetch()
-                .rowsUpdated()
-                .flatMap(rows -> {
+  private Mono<String> accountStatus(
+    String number
+  ) {
 
-                  if (rows != 1) {
-                    return Mono.error(
-                      new IllegalArgumentException(
-                        "Saldo insuficiente"));
-                  }
+    return db.sql(
+        "SELECT status FROM accounts " +
+          "WHERE account_number = :number"
+      )
+      .bind("number", number)
+      .map((row, metadata) ->
+        row.get(
+          "status",
+          String.class
+        )
+      )
+      .one();
+  }
 
-                  return Mono.empty();
-                })
-            )
+  private Mono<Void> insert(
+    UUID id,
+    TransferCommand command,
+    String fingerprint,
+    OffsetDateTime now
+  ) {
 
-            .then(
-              db.sql(
-                  "UPDATE accounts SET balance = balance + :amount " +
-                    "WHERE account_number = :number " +
-                    "AND status = 'ACTIVE' " +
-                    "AND currency = 'COP'")
-                .bind("amount", command.amount())
-                .bind("number", command.destinationAccount())
-                .fetch()
-                .rowsUpdated()
-                .flatMap(rows -> {
+    return db.sql(
+        "INSERT INTO transfers " +
+          "(id, client_reference, request_fingerprint, " +
+          "source_account, destination_account, amount, " +
+          "currency, status, processed_at) " +
+          "VALUES (:id,:ref,:fp,:source,:destination," +
+          ":amount,:currency,'PENDING',:processedAt)"
+      )
+      .bind("id", id)
+      .bind(
+        "ref",
+        command.clientReference()
+      )
+      .bind(
+        "fp",
+        fingerprint
+      )
+      .bind(
+        "source",
+        command.sourceAccount()
+      )
+      .bind(
+        "destination",
+        command.destinationAccount()
+      )
+      .bind(
+        "amount",
+        command.amount()
+          .setScale(
+            2,
+            RoundingMode.UNNECESSARY
+          )
+      )
+      .bind(
+        "currency",
+        command.currency()
+      )
+      .bind(
+        "processedAt",
+        now
+      )
+      .fetch()
+      .rowsUpdated()
+      .then();
+  }
 
-                  if (rows != 1) {
-                    return Mono.error(
-                      new IllegalArgumentException(
-                        "La cuenta destino no está activa"));
-                  }
+  private Mono<Void> debit(
+    TransferCommand command
+  ) {
 
-                  return Mono.empty();
-                })
-            )
+    return db.sql(
+        "UPDATE accounts SET " +
+          "balance = balance - :amount " +
+          "WHERE account_number = :number " +
+          "AND status = 'ACTIVE' " +
+          "AND currency = 'COP' " +
+          "AND balance >= :amount"
+      )
+      .bind(
+        "amount",
+        command.amount()
+      )
+      .bind(
+        "number",
+        command.sourceAccount()
+      )
+      .fetch()
+      .rowsUpdated()
+      .flatMap(rows ->
+        rows == 1
+          ? Mono.empty()
+          : Mono.error(
+          new IllegalArgumentException(
+            "Saldo insuficiente"
+          )
+        )
+      )
+      .then();
+  }
 
-            .then(
-              db.sql(
-                  "UPDATE transfers SET status='COMPLETED', " +
-                    "processed_at=:processedAt WHERE id=:id")
-                .bind("id", id)
-                .bind("processedAt", now)
-                .fetch()
-                .rowsUpdated()
-            )
+  private Mono<Void> credit(
+    TransferCommand command
+  ) {
 
-            .then(
-              db.sql(
-                  "SELECT * FROM transfers WHERE id=:id")
-                .bind("id", id)
-                .map((row, metadata) -> new Transfer(
-                  row.get("id", UUID.class),
-                  row.get("client_reference", String.class),
-                  row.get("source_account", String.class),
-                  row.get("destination_account", String.class),
-                  row.get("amount", BigDecimal.class),
-                  row.get("currency", String.class),
-                  TransferStatus.valueOf(
-                    row.get("status", String.class)),
-                  row.get("processed_at",
-                    OffsetDateTime.class),
-                  row.get("request_fingerprint",
-                    String.class)
-                ))
-                .one()
-            )
-        );
-      }));
+    return db.sql(
+        "UPDATE accounts SET " +
+          "balance = balance + :amount " +
+          "WHERE account_number = :number " +
+          "AND status = 'ACTIVE' " +
+          "AND currency = 'COP'"
+      )
+      .bind(
+        "amount",
+        command.amount()
+      )
+      .bind(
+        "number",
+        command.destinationAccount()
+      )
+      .fetch()
+      .rowsUpdated()
+      .flatMap(rows ->
+        rows == 1
+          ? Mono.empty()
+          : Mono.error(
+          new IllegalArgumentException(
+            "La cuenta destino no está activa"
+          )
+        )
+      )
+      .then();
+  }
+
+  private Mono<Void> markCompleted(
+    UUID id,
+    OffsetDateTime now
+  ) {
+
+    return db.sql(
+        "UPDATE transfers SET " +
+          "status='COMPLETED', " +
+          "processed_at=:processedAt " +
+          "WHERE id=:id"
+      )
+      .bind("id", id)
+      .bind(
+        "processedAt",
+        now
+      )
+      .fetch()
+      .rowsUpdated()
+      .then();
   }
 
   @Override
-  public Mono<Transfer> findById(UUID id) {
+  public Mono<Transfer> findById(
+    UUID id
+  ) {
 
-    return db.sql("SELECT * FROM transfers WHERE id=:id")
+    return db.sql(
+        "SELECT * FROM transfers " +
+          "WHERE id=:id"
+      )
       .bind("id", id)
-      .map((row, metadata) -> new Transfer(
-        row.get("id", UUID.class),
-        row.get("client_reference", String.class),
-        row.get("source_account", String.class),
-        row.get("destination_account", String.class),
-        row.get("amount", BigDecimal.class),
-        row.get("currency", String.class),
-        TransferStatus.valueOf(row.get("status", String.class)),
-        row.get("processed_at", OffsetDateTime.class),
-        row.get("request_fingerprint", String.class)
-      ))
+      .map(this::map)
       .one();
+  }
+
+  private Mono<Transfer> findByReference(
+    String reference
+  ) {
+
+    return db.sql(
+        "SELECT * FROM transfers " +
+          "WHERE client_reference=:ref"
+      )
+      .bind("ref", reference)
+      .map(this::map)
+      .one();
+  }
+
+  private Transfer map(
+    Row row,
+    Object ignored
+  ) {
+
+    return new Transfer(
+      row.get("id", UUID.class),
+      row.get(
+        "client_reference",
+        String.class
+      ),
+      row.get(
+        "source_account",
+        String.class
+      ),
+      row.get(
+        "destination_account",
+        String.class
+      ),
+      row.get(
+        "amount",
+        BigDecimal.class
+      ),
+      row.get(
+        "currency",
+        String.class
+      ),
+      TransferStatus.valueOf(
+        row.get(
+          "status",
+          String.class
+        )
+      ),
+      row.get(
+        "processed_at",
+        OffsetDateTime.class
+      ),
+      row.get(
+        "request_fingerprint",
+        String.class
+      )
+    );
+  }
+
+  private boolean sameRequest(
+    Transfer transfer,
+    TransferCommand command
+  ) {
+
+    return transfer.fingerprint()
+      .equals(
+        createFingerprint(command)
+      );
+  }
+
+  private String createFingerprint(
+    TransferCommand command
+  ) {
+
+    try {
+
+      String payload = String.join(
+        "|",
+        command.clientReference(),
+        command.sourceAccount(),
+        command.destinationAccount(),
+        command.amount()
+          .setScale(
+            2,
+            RoundingMode.UNNECESSARY
+          )
+          .toPlainString(),
+        command.currency()
+      );
+
+      return HexFormat.of().formatHex(
+        MessageDigest
+          .getInstance("SHA-256")
+          .digest(
+            payload.getBytes(
+              StandardCharsets.UTF_8
+            )
+          )
+      );
+
+    } catch (Exception e) {
+
+      throw new IllegalStateException(
+        "No fue posible calcular la huella",
+        e
+      );
+    }
   }
 }
