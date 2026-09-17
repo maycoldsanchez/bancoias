@@ -7,10 +7,9 @@ import org.springframework.data.repository.reactive.ReactiveCrudRepository;
 import reactor.core.publisher.Mono;
 
 import java.math.BigDecimal;
-import java.util.UUID;
 
 public interface IAccountRepository
-  extends ReactiveCrudRepository<AccountEntity, UUID> {
+  extends ReactiveCrudRepository<AccountEntity, String> {
 
   Mono<AccountEntity> findByAccountNumber(String accountNumber);
 

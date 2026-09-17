@@ -7,4 +7,5 @@ public record ErrorResponse(
   String message,
   String correlationId,
   OffsetDateTime timestamp
-) { }
+) {
+}
