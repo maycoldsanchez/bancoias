@@ -65,15 +65,14 @@ public class R2dbcTransferProcessingAdapter
   private Mono<Transfer> createNew(TransferCommand command) {
 
     UUID id = UUID.randomUUID();
-    OffsetDateTime now = OffsetDateTime.now();
     String fingerprint = fingerprint(command);
 
     return tx.transactional(
       validateAccounts(command)
-        .then(insert(id, command, fingerprint, now))
+        .then(insert(id, command, fingerprint))
         .then(debit(command))
         .then(credit(command))
-        .then(markCompleted(id, now))
+        .then(markCompleted(id, OffsetDateTime.now()))
         .then(findById(id))
     );
   }
@@ -143,20 +142,29 @@ public class R2dbcTransferProcessingAdapter
   private Mono<Void> insert(
     UUID id,
     TransferCommand command,
-    String fingerprint,
-    OffsetDateTime now
+    String fingerprint
   ) {
 
     return transferRepository
-      .save(
-        transferEntityMapper.toEntity(
-          id,
-          command,
-          fingerprint,
-          now
-        )
+      .insert(
+        id,
+        command.clientReference(),
+        fingerprint,
+        command.sourceAccount(),
+        command.destinationAccount(),
+        command.amount(),
+        command.currency(),
+        "PENDING",
+        null
       )
-      .then();
+      .flatMap(rowsUpdated ->
+        rowsUpdated == 1
+          ? Mono.empty()
+          : Mono.error(new BusinessException(
+          "TRANSFER_CREATION_FAILED",
+          "No fue posible crear la transferencia"
+        ))
+      );
   }
 
   private Mono<Void> debit(TransferCommand command) {
@@ -202,7 +210,11 @@ public class R2dbcTransferProcessingAdapter
 
     return transferRepository
       .markCompleted(id, now)
-      .then();
+      .flatMap(rowsUpdated ->
+        rowsUpdated == 1
+          ? Mono.empty()
+          : Mono.error(new TransferNotFoundException())
+      );
   }
 
   @Override

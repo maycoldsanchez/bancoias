@@ -3,9 +3,9 @@ spring:
     name: bancoias
 
   r2dbc:
-    url: ${DATABASE_R2DBC_URL}
-    username: ${DATABASE_USERNAME}
-    password: ${DATABASE_PASSWORD}
+    url: r2dbc:postgresql://${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+    username: ${POSTGRES_USER}
+    password: ${POSTGRES_PASSWORD}
 
   sql:
     init:
@@ -13,9 +13,9 @@ spring:
 
   flyway:
     enabled: true
-    url: ${DATABASE_MIGRATION_JDBC_URL}
-    user: ${DATABASE_USERNAME}
-    password: ${DATABASE_PASSWORD}
+    url: jdbc:postgresql://${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+    user: ${POSTGRES_USER}
+    password: ${POSTGRES_PASSWORD}
     locations: classpath:db/migration/postgresql
 
 management:
@@ -23,3 +23,10 @@ management:
     web:
       exposure:
         include: health
+
+logging:
+  level:
+    root: INFO
+    com.maycol.bancoias: DEBUG
+    org.springframework.r2dbc: DEBUG
+    org.springframework.transaction: DEBUG

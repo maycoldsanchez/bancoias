@@ -14,7 +14,7 @@ CREATE TABLE transfers (
     amount NUMERIC(18, 2) NOT NULL CHECK (amount > 0),
     currency VARCHAR(3) NOT NULL,
     status VARCHAR(20) NOT NULL,
-    processed_at TIMESTAMP WITH TIME ZONE NOT NULL
+    processed_at TIMESTAMP WITH TIME ZONE
 );
 
 INSERT INTO accounts (account_number, status, currency, balance) VALUES
